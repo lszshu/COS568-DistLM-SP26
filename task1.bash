@@ -1,4 +1,4 @@
-export GLUE_DIR=$HOME/glue_data
+export GLUE_DIR=$HOME/COS568-DistLM-SP26/glue_data
 export TASK_NAME=RTE
 
 python3 run_glue.py \
