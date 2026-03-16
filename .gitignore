@@ -1,4 +1,6 @@
-/__pycache__
+/__pycache__/
+*.pyc
 *.out
 /glue_data/
 *.tsv
+__pycache__/
