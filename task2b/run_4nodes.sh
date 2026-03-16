@@ -13,11 +13,11 @@ MASTER_PORT="$3"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GLUE_DIR="${GLUE_DIR:-$REPO_ROOT/glue_data}"
 TASK_NAME="${TASK_NAME:-RTE}"
-OUTPUT_DIR="${4:-$REPO_ROOT/task2a/results}"
+OUTPUT_DIR="${4:-$REPO_ROOT/task2b/results}"
 
 mkdir -p "$OUTPUT_DIR"
 
-python3 "$REPO_ROOT/task2a/run_glue.py" \
+python3 "$REPO_ROOT/task2b/run_glue.py" \
   --model_type bert \
   --model_name_or_path bert-base-cased \
   --task_name "$TASK_NAME" \

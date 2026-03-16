@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -lt 3 ]; then
-  echo "Usage: $0 <rank:0-3> <master_ip> <master_port> [output_dir]"
+if [ "$#" -lt 4 ]; then
+  echo "Usage: $0 <mode:gather_scatter|all_reduce|ddp> <rank:0-3> <master_ip> <master_port> [output_dir]"
   exit 1
 fi
 
-RANK="$1"
-MASTER_IP="$2"
-MASTER_PORT="$3"
+MODE="$1"
+RANK="$2"
+MASTER_IP="$3"
+MASTER_PORT="$4"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GLUE_DIR="${GLUE_DIR:-$REPO_ROOT/glue_data}"
 TASK_NAME="${TASK_NAME:-RTE}"
-OUTPUT_DIR="${4:-$REPO_ROOT/task2a/results}"
+OUTPUT_DIR="${5:-$REPO_ROOT/task4/results/$MODE}"
 
 mkdir -p "$OUTPUT_DIR"
 
-python3 "$REPO_ROOT/task2a/run_glue.py" \
+python3 "$REPO_ROOT/task4/run_glue.py" \
+  --mode "$MODE" \
   --model_type bert \
   --model_name_or_path bert-base-cased \
   --task_name "$TASK_NAME" \
