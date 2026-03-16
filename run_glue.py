@@ -19,9 +19,11 @@ from __future__ import absolute_import, division, print_function
 
 import argparse
 import glob
+import json
 import logging
 import os
 import random
+import time
 
 import numpy as np
 import torch
@@ -70,19 +72,77 @@ def set_seed(args):
     torch.cuda.manual_seed_all(args.seed)
 
 
+def is_distributed(args):
+    return args.local_rank != -1 and args.world_size > 1
+
+
+def is_main_process(args):
+    return args.local_rank in [-1, 0]
+
+
+def rank_id(args):
+    return args.local_rank if args.local_rank != -1 else 0
+
+
+def save_json(path, payload):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as writer:
+        json.dump(payload, writer, indent=2, sort_keys=True)
+
+
+def deliverables_dir(args):
+    return os.path.join(args.output_dir, "deliverables")
+
+
+def average_excluding_first(values):
+    if len(values) <= 1:
+        return None
+    return sum(values[1:]) / float(len(values) - 1)
+
+
+def save_deliverables(args, train_history, final_eval_results):
+    output_dir = deliverables_dir(args)
+    os.makedirs(output_dir, exist_ok=True)
+
+    rank = rank_id(args)
+    save_json(
+        os.path.join(output_dir, "loss_curve_rank{}.json".format(rank)),
+        train_history["loss_curve"],
+    )
+    save_json(
+        os.path.join(output_dir, "summary_rank{}.json".format(rank)),
+        {
+            "rank": rank,
+            "world_size": args.world_size,
+            "per_device_train_batch_size": args.per_device_train_batch_size,
+            "total_train_batch_size": args.per_device_train_batch_size * args.world_size,
+            "first_five_losses": train_history["first_five_losses"],
+            "iteration_times_sec": train_history["iteration_times_sec"],
+            "average_iteration_time_excluding_first_sec": average_excluding_first(
+                train_history["iteration_times_sec"]
+            ),
+            "sync_times_sec": train_history["sync_times_sec"],
+            "average_sync_time_excluding_first_sec": average_excluding_first(
+                train_history["sync_times_sec"]
+            ),
+            "epoch_eval_history": train_history["epoch_eval_history"],
+            "final_eval_results": final_eval_results,
+        },
+    )
+
+
 def train(args, train_dataset, model, tokenizer):
     """ Train the model """
 
     args.train_batch_size = args.per_device_train_batch_size
     train_sampler = RandomSampler(train_dataset)
-    # train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
-    from torch.utils.data.distributed import DistributedSampler
-    train_sampler = DistributedSampler(
-        train_dataset,
-        num_replicas=args.world_size,
-        rank=args.local_rank,
-        shuffle=True
-    )
+    if is_distributed(args):
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=args.world_size,
+            rank=args.local_rank,
+            shuffle=True
+        )
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -126,9 +186,20 @@ def train(args, train_dataset, model, tokenizer):
     model.zero_grad()
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0])
     set_seed(args)  # Added here for reproductibility (even between python 2 and 3)
-    for _ in train_iterator:
+    train_history = {
+        "loss_curve": [],
+        "first_five_losses": [],
+        "iteration_times_sec": [],
+        "sync_times_sec": [],
+        "epoch_eval_history": [],
+    }
+    for epoch in train_iterator:
+        if is_distributed(args):
+            train_sampler.set_epoch(epoch)
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
+            iteration_start = time.perf_counter()
+            sync_time = 0.0
             model.train()
             batch = tuple(t.to(args.device) for t in batch)
             inputs = {'input_ids':      batch[0],
@@ -137,6 +208,7 @@ def train(args, train_dataset, model, tokenizer):
                       'labels':         batch[3]}
             outputs = model(**inputs)
             loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
+            raw_loss = loss.item()
 
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
@@ -151,7 +223,8 @@ def train(args, train_dataset, model, tokenizer):
                 loss.backward()
                 ##################################################
                 # torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                if args.local_rank != -1:
+                if is_distributed(args):
+                    sync_start = time.perf_counter()
                     for param in model.parameters():
                         if param.grad is None:
                             continue
@@ -168,11 +241,24 @@ def train(args, train_dataset, model, tokenizer):
                             dist.scatter(param.grad.data, scatter_list=scatter_list, src=0)
                         else:
                             dist.gather(grad, dst=0)
-                            dist.scatter(param.grad.data, scatter_list=[], src=0)
+                            dist.scatter(param.grad.data, src=0)
+                    sync_time = time.perf_counter() - sync_start
 
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
             tr_loss += loss.item()
+            iteration_time = time.perf_counter() - iteration_start
+            train_history["loss_curve"].append({
+                "iteration": len(train_history["loss_curve"]) + 1,
+                "epoch": epoch + 1,
+                "step_in_epoch": step + 1,
+                "loss": raw_loss,
+            })
+            train_history["iteration_times_sec"].append(iteration_time)
+            train_history["sync_times_sec"].append(sync_time)
+            if len(train_history["first_five_losses"]) < 5:
+                train_history["first_five_losses"].append(raw_loss)
+                logger.info("rank=%d epoch=%d step=%d loss=%.6f", rank_id(args), epoch + 1, step + 1, raw_loss)
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 ##################################################
                 # TODO(cos568): perform a single optimization step (parameter update) by invoking the optimizer (expect one line of code)
@@ -191,10 +277,15 @@ def train(args, train_dataset, model, tokenizer):
         
         ##################################################
         # TODO(cos568): call evaluate() here to get the model performance after every epoch. (expect one line of code)
-        evaluate(args, model, tokenizer)
+        if args.do_eval and is_main_process(args):
+            epoch_eval_results = evaluate(args, model, tokenizer, prefix="epoch_{}".format(epoch + 1))
+            train_history["epoch_eval_history"].append({
+                "epoch": epoch + 1,
+                "metrics": epoch_eval_results,
+            })
         ##################################################
 
-    return global_step, tr_loss / global_step
+    return global_step, tr_loss / global_step, train_history
 
 
 def evaluate(args, model, tokenizer, prefix=""):
@@ -249,9 +340,11 @@ def evaluate(args, model, tokenizer, prefix=""):
         elif args.output_mode == "regression":
             preds = np.squeeze(preds)
         result = compute_metrics(eval_task, preds, out_label_ids)
+        result["eval_loss"] = eval_loss
         results.update(result)
 
-        output_eval_file = os.path.join(eval_output_dir, "eval_results.txt")
+        output_suffix = prefix if prefix else "final"
+        output_eval_file = os.path.join(eval_output_dir, "eval_results_{}.txt".format(output_suffix))
         with open(output_eval_file, "w") as writer:
             logger.info("***** Eval results {} *****".format(prefix))
             for key in sorted(result.keys()):
@@ -384,21 +477,32 @@ def main():
                              "See details at https://nvidia.github.io/apex/amp.html")
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="For distributed training: local_rank. If single-node training, local_rank defaults to -1.")
+    parser.add_argument("--master_ip", type=str, default="",
+                        help="Master node IP for torch.distributed TCP initialization.")
+    parser.add_argument("--master_port", type=int, default=0,
+                        help="Master node port for torch.distributed TCP initialization.")
+    parser.add_argument("--world_size", type=int, default=1,
+                        help="Total number of participating workers.")
     args = parser.parse_args()
 
-    dist.init_process_group(
-        backend="gloo",   # CPU nodes
-        init_method=f"tcp://{args.master_ip}:{args.master_port}",
-        world_size=args.world_size,
-        rank=args.local_rank
-    )
-    
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
         raise ValueError("Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(args.output_dir))
 
     # set up (distributed) training
     args.device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     args.n_gpu = torch.cuda.device_count()
+    if args.local_rank == -1:
+        args.world_size = 1
+    else:
+        if not args.master_ip or args.master_port <= 0:
+            raise ValueError("Distributed training requires --master_ip, --master_port, and --world_size.")
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"tcp://{args.master_ip}:{args.master_port}",
+            world_size=args.world_size,
+            rank=args.local_rank
+        )
+    os.makedirs(deliverables_dir(args), exist_ok=True)
 
     # Setup logging
     logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
@@ -444,13 +548,23 @@ def main():
 
 
     # Training
+    train_history = {
+        "loss_curve": [],
+        "first_five_losses": [],
+        "iteration_times_sec": [],
+        "sync_times_sec": [],
+        "epoch_eval_history": [],
+    }
     if args.do_train:
         train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
-        global_step, tr_loss = train(args, train_dataset, model, tokenizer)
+        global_step, tr_loss, train_history = train(args, train_dataset, model, tokenizer)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
     # Evaluation
-    evaluate(args, model, tokenizer, prefix="")
+    final_eval_results = {}
+    if args.do_eval and is_main_process(args):
+        final_eval_results = evaluate(args, model, tokenizer, prefix="final")
+    save_deliverables(args, train_history, final_eval_results)
 
 if __name__ == "__main__":
     main()
