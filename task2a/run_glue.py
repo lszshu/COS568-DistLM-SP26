@@ -28,6 +28,7 @@ import time
 
 import numpy as np
 import torch
+from torch.profiler import ProfilerActivity, profile, schedule
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
                               TensorDataset)
 from torch.utils.data.distributed import DistributedSampler
@@ -99,13 +100,53 @@ def deliverables_dir(args):
     return os.path.join(args.output_dir, "deliverables")
 
 
+def traces_dir(args):
+    return os.path.join(args.output_dir, "traces")
+
+
 def average_excluding_first(values):
     if len(values) <= 1:
         return None
     return sum(values[1:]) / float(len(values) - 1)
 
 
-def save_deliverables(args, train_history, final_eval_results):
+def compute_profile_window(values):
+    return values[1:min(len(values), 4)]
+
+
+def summarize_profiler(prof, args, train_history):
+    trace_path = os.path.join(traces_dir(args), "task2a_rank{}.json".format(rank_id(args)))
+    os.makedirs(os.path.dirname(trace_path), exist_ok=True)
+    prof.export_chrome_trace(trace_path)
+
+    comm_keywords = ("gather", "scatter", "gloo", "c10d", "ProcessGroup", "nccl")
+    communication_events = []
+    for event in prof.key_averages():
+        if any(keyword.lower() in event.key.lower() for keyword in comm_keywords):
+            communication_events.append({
+                "name": event.key,
+                "cpu_time_total_us": event.cpu_time_total,
+                "self_cpu_time_total_us": event.self_cpu_time_total,
+                "count": event.count,
+            })
+
+    profiled_sync_overhead_pct = []
+    for iteration_time, sync_time in zip(
+        compute_profile_window(train_history["iteration_times_sec"]),
+        compute_profile_window(train_history["sync_times_sec"]),
+    ):
+        profiled_sync_overhead_pct.append(100.0 * sync_time / iteration_time if iteration_time > 0 else None)
+
+    return {
+        "trace_file": trace_path,
+        "communication_events": communication_events,
+        "profiled_iteration_times_sec": compute_profile_window(train_history["iteration_times_sec"]),
+        "profiled_sync_times_sec": compute_profile_window(train_history["sync_times_sec"]),
+        "profiled_sync_overhead_pct": profiled_sync_overhead_pct,
+    }
+
+
+def save_deliverables(args, train_history, final_eval_results, profiler_summary=None):
     output_dir = deliverables_dir(args)
     os.makedirs(output_dir, exist_ok=True)
 
@@ -132,6 +173,7 @@ def save_deliverables(args, train_history, final_eval_results):
             ),
             "epoch_eval_history": train_history["epoch_eval_history"],
             "final_eval_results": final_eval_results,
+            "profiler": profiler_summary,
         },
     )
 
@@ -198,6 +240,17 @@ def train(args, train_dataset, model, tokenizer):
         "sync_times_sec": [],
         "epoch_eval_history": [],
     }
+    prof = None
+    profiler_summary = None
+    if args.profile_task4:
+        prof = profile(
+            activities=[ProfilerActivity.CPU],
+            schedule=schedule(wait=1, warmup=0, active=3, repeat=1),
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+        )
+        prof.start()
     for epoch in train_iterator:
         if is_distributed(args):
             train_sampler.set_epoch(epoch)
@@ -261,6 +314,8 @@ def train(args, train_dataset, model, tokenizer):
             })
             train_history["iteration_times_sec"].append(iteration_time)
             train_history["sync_times_sec"].append(sync_time)
+            if prof is not None:
+                prof.step()
             if len(train_history["first_five_losses"]) < 5:
                 train_history["first_five_losses"].append(raw_loss)
                 logger.info("rank=%d epoch=%d step=%d loss=%.6f", rank_id(args), epoch + 1, step + 1, raw_loss)
@@ -290,7 +345,11 @@ def train(args, train_dataset, model, tokenizer):
             })
         ##################################################
 
-    return global_step, tr_loss / global_step, train_history
+    if prof is not None:
+        prof.stop()
+        profiler_summary = summarize_profiler(prof, args, train_history)
+
+    return global_step, tr_loss / global_step, train_history, profiler_summary
 
 
 def evaluate(args, model, tokenizer, prefix=""):
@@ -489,6 +548,8 @@ def main():
                         help="Master node port for torch.distributed TCP initialization.")
     parser.add_argument("--world_size", type=int, default=1,
                         help="Total number of participating workers.")
+    parser.add_argument("--profile_task4", action='store_true',
+                        help="Enable torch.profiler scheduling for Task 4.")
     args = parser.parse_args()
 
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
@@ -561,16 +622,17 @@ def main():
         "sync_times_sec": [],
         "epoch_eval_history": [],
     }
+    profiler_summary = None
     if args.do_train:
         train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
-        global_step, tr_loss, train_history = train(args, train_dataset, model, tokenizer)
+        global_step, tr_loss, train_history, profiler_summary = train(args, train_dataset, model, tokenizer)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
     # Evaluation
     final_eval_results = {}
     if args.do_eval and is_main_process(args):
         final_eval_results = evaluate(args, model, tokenizer, prefix="final")
-    save_deliverables(args, train_history, final_eval_results)
+    save_deliverables(args, train_history, final_eval_results, profiler_summary)
 
 if __name__ == "__main__":
     main()

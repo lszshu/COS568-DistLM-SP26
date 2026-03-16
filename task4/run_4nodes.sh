@@ -18,8 +18,23 @@ OUTPUT_DIR="${5:-$REPO_ROOT/task4/results/$MODE}"
 
 mkdir -p "$OUTPUT_DIR"
 
-python3 "$REPO_ROOT/task4/run_glue.py" \
-  --mode "$MODE" \
+case "$MODE" in
+  gather_scatter)
+    SCRIPT_PATH="$REPO_ROOT/task2a/run_glue.py"
+    ;;
+  all_reduce)
+    SCRIPT_PATH="$REPO_ROOT/task2b/run_glue.py"
+    ;;
+  ddp)
+    SCRIPT_PATH="$REPO_ROOT/task3/run_glue.py"
+    ;;
+  *)
+    echo "Unsupported mode: $MODE"
+    exit 1
+    ;;
+esac
+
+python3 "$SCRIPT_PATH" \
   --model_type bert \
   --model_name_or_path bert-base-cased \
   --task_name "$TASK_NAME" \
@@ -35,4 +50,5 @@ python3 "$REPO_ROOT/task4/run_glue.py" \
   --master_ip "$MASTER_IP" \
   --master_port "$MASTER_PORT" \
   --world_size 4 \
-  --local_rank "$RANK"
+  --local_rank "$RANK" \
+  --profile_task4
