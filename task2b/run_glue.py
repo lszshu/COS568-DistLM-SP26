@@ -130,8 +130,6 @@ def save_deliverables(args, train_history, final_eval_results):
 def train(args, train_dataset, model, tokenizer):
     """Train the model."""
 
-    del tokenizer
-
     args.train_batch_size = args.per_device_train_batch_size
     train_sampler = RandomSampler(train_dataset)
     if is_distributed(args):
@@ -377,7 +375,8 @@ def evaluate(args, model, tokenizer, prefix=""):
 
 
 def load_and_cache_examples(args, task, tokenizer, evaluate=False):
-    if args.local_rank not in [-1, 0]:
+    sync_cache = is_distributed(args) and not evaluate
+    if sync_cache and args.local_rank not in [-1, 0]:
         torch.distributed.barrier()
 
     processor = processors[task]()
@@ -419,7 +418,7 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
             logger.info("Saving features into cached file %s", cached_features_file)
             torch.save(features, cached_features_file)
 
-    if args.local_rank == 0:
+    if sync_cache and args.local_rank == 0:
         torch.distributed.barrier()
 
     all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)

@@ -65,8 +65,6 @@ def set_seed(args):
 
 
 def train(args, train_dataset, model, tokenizer):
-    del tokenizer
-
     args.train_batch_size = args.per_device_train_batch_size
     train_sampler = RandomSampler(train_dataset)
     train_dataloader = DataLoader(

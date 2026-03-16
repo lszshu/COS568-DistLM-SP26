@@ -149,8 +149,6 @@ def save_deliverables(args, train_history, final_eval_results):
 
 
 def train(args, train_dataset, model, tokenizer, ddp_state):
-    del tokenizer
-
     args.train_batch_size = args.per_device_train_batch_size
     train_sampler = RandomSampler(train_dataset)
     if is_distributed(args):
