@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import random
+import sys
 import time
 
 import numpy as np
@@ -46,6 +47,10 @@ from pytorch_transformers import (WEIGHTS_NAME, BertConfig,
 from pytorch_transformers import AdamW, WarmupLinearSchedule
 
 import torch.distributed as dist
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 from utils_glue import (compute_metrics, convert_examples_to_features,
                         output_modes, processors)
