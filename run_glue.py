@@ -43,8 +43,11 @@ from pytorch_transformers import (WEIGHTS_NAME, BertConfig,
 
 from pytorch_transformers import AdamW, WarmupLinearSchedule
 
+import torch.distributed as dist
+
 from utils_glue import (compute_metrics, convert_examples_to_features,
                         output_modes, processors)
+
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +75,20 @@ def train(args, train_dataset, model, tokenizer):
 
     args.train_batch_size = args.per_device_train_batch_size
     train_sampler = RandomSampler(train_dataset)
-    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
+    # train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
+    from torch.utils.data.distributed import DistributedSampler
+    train_sampler = DistributedSampler(
+        train_dataset,
+        num_replicas=args.world_size,
+        rank=args.local_rank,
+        shuffle=True
+    )
+
+    train_dataloader = DataLoader(
+        train_dataset,
+        sampler=train_sampler,
+        batch_size=args.per_device_train_batch_size
+    )
 
     if args.max_steps > 0:
         t_total = args.max_steps
@@ -134,6 +150,26 @@ def train(args, train_dataset, model, tokenizer):
                 # TODO(cos568): perform backward pass here (expect one line of code)
                 loss.backward()
                 ##################################################
+                # torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                if args.local_rank != -1:
+                    for param in model.parameters():
+                        if param.grad is None:
+                            continue
+
+                        grad = param.grad.data
+
+                        if args.local_rank == 0:
+                            gather_list = [torch.zeros_like(grad) for _ in range(args.world_size)]
+                            dist.gather(grad, gather_list=gather_list, dst=0)
+
+                            avg_grad = sum(gather_list) / args.world_size
+
+                            scatter_list = [avg_grad.clone() for _ in range(args.world_size)]
+                            dist.scatter(param.grad.data, scatter_list=scatter_list, src=0)
+                        else:
+                            dist.gather(grad, dst=0)
+                            dist.scatter(param.grad.data, scatter_list=[], src=0)
+
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
             tr_loss += loss.item()
@@ -350,6 +386,13 @@ def main():
                         help="For distributed training: local_rank. If single-node training, local_rank defaults to -1.")
     args = parser.parse_args()
 
+    dist.init_process_group(
+        backend="gloo",   # CPU nodes
+        init_method=f"tcp://{args.master_ip}:{args.master_port}",
+        world_size=args.world_size,
+        rank=args.local_rank
+    )
+    
     if os.path.exists(args.output_dir) and os.listdir(args.output_dir) and args.do_train and not args.overwrite_output_dir:
         raise ValueError("Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(args.output_dir))
 
